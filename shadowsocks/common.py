@@ -24,6 +24,7 @@ import logging
 import binascii
 import re
 import hashlib
+import random
 from configloader import load_config, get_config
 
 
@@ -61,6 +62,14 @@ def to_str(s):
         if isinstance(s, bytes):
             return s.decode('utf-8')
     return s
+
+def random_base64_str(randomlength = 8):
+    str = ''
+    chars = 'ABCDEF0123456789'
+    length = len(chars) - 1
+    for i in range(randomlength):
+        str += chars[random.randint(0, length)]
+    return str
 
 
 def int32(x):
@@ -167,11 +176,6 @@ def get_mu_host(id, md5):
 
 def get_md5(data):
     m1 = hashlib.md5(data.encode('utf-8'))
-    return m1.hexdigest()
-
-
-def get_ip_md5(data, salt):
-    m1 = hashlib.md5(data.encode('utf-8') + salt.encode('utf-8'))
     return m1.hexdigest()
 
 
@@ -289,6 +293,9 @@ def parse_header(data):
         return None
     return connecttype, addrtype, to_bytes(dest_addr), dest_port, header_length
 
+def getRealIp(ip):
+    return to_str(ip.replace("::ffff:", ""))
+
 
 class IPNetwork(object):
     ADDRLENGTH = {socket.AF_INET: 32, socket.AF_INET6: 128, False: 0}
@@ -305,6 +312,9 @@ class IPNetwork(object):
     def add_network(self, addr):
         if addr is "":
             return
+
+        addr = addr.replace("::ffff:", "")
+
         block = addr.split('/')
         addr_family = is_ip(block[0])
         addr_len = IPNetwork.ADDRLENGTH[addr_family]
@@ -333,6 +343,8 @@ class IPNetwork(object):
             self._network_list_v6.append((ip, prefix_size))
 
     def __contains__(self, addr):
+        addr = addr.replace("::ffff:", "")
+
         addr_family = is_ip(addr)
         if addr_family is socket.AF_INET:
             ip, = struct.unpack("!I", socket.inet_aton(addr))

@@ -42,6 +42,8 @@ class WebTransfer(object):
         self.node_ip_list = []
         self.mu_port_list = []
 
+        self.has_stopped = False
+
     def update_all_user(self, dt_transfer):
         global webapi
 
@@ -409,8 +411,6 @@ class WebTransfer(object):
             cfg['detect_hex_list'] = self.detect_hex_list.copy()
             cfg['detect_text_list'] = self.detect_text_list.copy()
 
-            cfg['ip_md5_salt'] = get_config().IP_MD5_SALT
-
             if self.is_relay and row['is_multi_user'] != 2:
                 temp_relay_rules = {}
                 for id in self.relay_rule_list:
@@ -673,6 +673,8 @@ class WebTransfer(object):
                     # logging.warn('db thread except:%s' % e)
                 if db_instance.event.wait(60) or not db_instance.is_all_thread_alive():
                     break
+                if db_instance.has_stopped:
+                    break
         except KeyboardInterrupt as e:
             pass
         db_instance.del_servers()
@@ -682,12 +684,10 @@ class WebTransfer(object):
     @staticmethod
     def thread_db_stop():
         global db_instance
+        db_instance.has_stopped = True
         db_instance.event.set()
 
     def is_all_thread_alive(self):
-        for port in ServerPool.get_instance().thread_pool:
-            if not ServerPool.get_instance().thread_pool[port].is_alive():
-                return False
         if not ServerPool.get_instance().thread.is_alive():
             return False
         return True

@@ -35,14 +35,12 @@ from shadowsocks.obfsplugin import plain
 from shadowsocks.common import to_bytes, to_str, ord
 from shadowsocks import lru_cache
 
-def create_tls_ticket_auth_obfs(method):
-    return tls_ticket_auth(method)
+def create_simple_obfs_tls(method):
+    return simple_obfs_tls(method)
 
 obfs_map = {
-        'tls1.2_ticket_auth': (create_tls_ticket_auth_obfs,),
-        'tls1.2_ticket_auth_compatible': (create_tls_ticket_auth_obfs,),
-        'tls1.2_ticket_fastauth': (create_tls_ticket_auth_obfs,),
-        'tls1.2_ticket_fastauth_compatible': (create_tls_ticket_auth_obfs,),
+        'simple_obfs_tls': (create_simple_obfs_tls,),
+        'simple_obfs_tls_compatible': (create_simple_obfs_tls,),
 }
 
 def match_begin(str1, str2):
@@ -57,10 +55,11 @@ class obfs_auth_data(object):
         self.client_id = os.urandom(32)
         self.startup_time = int(time.time() - 60 * 30) & 0xFFFFFFFF
 
-class tls_ticket_auth(plain.plain):
+class simple_obfs_tls(plain.plain):
     def __init__(self, method):
         self.method = method
-        self.handshake_status = 0
+        self.obfs_stage = 0
+        self.deobfs_stage = 0
         self.send_buffer = b''
         self.recv_buffer = b''
         self.client_id = b''
@@ -87,21 +86,15 @@ class tls_ticket_auth(plain.plain):
         return data
 
     def client_encode(self, buf):
-        if self.handshake_status == -1:
+        raise Exception('Need to finish')
+        if self.obfs_stage == -1:
             return buf
-        if self.handshake_status == 8:
-            ret = b''
-            while len(buf) > 2048:
-                size = min(struct.unpack('>H', os.urandom(2))[0] % 4096 + 100, len(buf))
-                ret += b"\x17" + self.tls_version + struct.pack('>H', size) + buf[:size]
-                buf = buf[size:]
-            if len(buf) > 0:
-                ret += b"\x17" + self.tls_version + struct.pack('>H', len(buf)) + buf
+        if self.obfs_stage == 1:
+            self.obfs_stage += 1
+            ret = b"\x17" + self.tls_version + struct.pack('>H', len(buf)) + buf
             return ret
-        if len(buf) > 0:
-            self.send_buffer += b"\x17" + self.tls_version + struct.pack('>H', len(buf)) + buf
-        if self.handshake_status == 0:
-            self.handshake_status = 1
+        if self.obfs_stage == 0:
+            self.obfs_stage += 1
             data = self.tls_version + self.pack_auth_data(self.server_info.data.client_id) + b"\x20" + self.server_info.data.client_id + binascii.unhexlify(b"001cc02bc02fcca9cca8cc14cc13c00ac014c009c013009c0035002f000a" + b"0100")
             ext = binascii.unhexlify(b"ff01000100")
             host = self.server_info.obfs_param or self.server_info.host
@@ -122,21 +115,14 @@ class tls_ticket_auth(plain.plain):
             data = b"\x01\x00" + struct.pack('>H', len(data)) + data
             data = b"\x16\x03\x01" + struct.pack('>H', len(data)) + data
             return data
-        elif self.handshake_status == 1 and len(buf) == 0:
-            data = b"\x14" + self.tls_version + b"\x00\x01\x01" #ChangeCipherSpec
-            data += b"\x16" + self.tls_version + b"\x00\x20" + os.urandom(22) #Finished
-            data += hmac.new(self.server_info.key + self.server_info.data.client_id, data, hashlib.sha1).digest()[:10]
-            ret = data + self.send_buffer
-            self.send_buffer = b''
-            self.handshake_status = 8
-            return ret
-        return b''
+        return buf
 
     def client_decode(self, buf):
-        if self.handshake_status == -1:
+        raise Exception('Need to finish')
+        if self.deobfs_stage == -1:
             return (buf, False)
 
-        if self.handshake_status == 8:
+        if self.deobfs_stage == 8:
             ret = b''
             self.recv_buffer += buf
             while len(self.recv_buffer) > 5:
@@ -161,9 +147,9 @@ class tls_ticket_auth(plain.plain):
         return (b'', True)
 
     def server_encode(self, buf):
-        if self.handshake_status == -1:
+        if self.obfs_stage == -1:
             return buf
-        if (self.handshake_status & 8) == 8:
+        if self.obfs_stage == 1:
             ret = b''
             while len(buf) > 2048:
                 size = min(struct.unpack('>H', os.urandom(2))[0] % 4096 + 100, len(buf))
@@ -172,36 +158,50 @@ class tls_ticket_auth(plain.plain):
             if len(buf) > 0:
                 ret += b"\x17" + self.tls_version + struct.pack('>H', len(buf)) + buf
             return ret
-        self.handshake_status |= 8
-        data = self.tls_version + self.pack_auth_data(self.client_id) + b"\x20" + self.client_id + binascii.unhexlify(b"c02f000005ff01000100")
-        data = b"\x02\x00" + struct.pack('>H', len(data)) + data #server hello
-        data = b"\x16" + self.tls_version + struct.pack('>H', len(data)) + data
-        if random.randint(0, 8) < 1:
-            ticket = os.urandom((struct.unpack('>H', os.urandom(2))[0] % 164) * 2 + 64)
-            ticket = struct.pack('>H', len(ticket) + 4) + b"\x04\x00" + struct.pack('>H', len(ticket)) + ticket
-            data += b"\x16" + self.tls_version + ticket #New session ticket
+
+        utc_time = int(time.time()) & 0xFFFFFFFF
+
+        if len(self.client_id) < 32:
+            session_id = os.urandom(32)
+        else:
+            session_id = self.client_id[:32]
+
+        data = struct.pack('>I', utc_time) + os.urandom(28) + b"\x20" + session_id + b"\xcc\xa8\x00\x00\x00\xff\x01\x00\x01\x00\x00\x17\x00\x00\x00\x0b\x00\x02\x01\x00" #random_unix_time, ramdom_byte, session_id_len, session_id, the reset
+        data = b"\x02\x00" + struct.pack('>H', 87) + b"\x03\x03" + data #handshake_type, handshake_len_1, handshake_len_2, handshake_version
+        data = b"\x16\x03\x01" + struct.pack('>H', 91) + data #content_type, version, len
+
         data += b"\x14" + self.tls_version + b"\x00\x01\x01" #ChangeCipherSpec
-        finish_len = random.choice([32, 40])
-        data += b"\x16" + self.tls_version + struct.pack('>H', finish_len) + os.urandom(finish_len - 10) #Finished
-        data += hmac.new(self.server_info.key + self.client_id, data, hashlib.sha1).digest()[:10]
-        if buf:
-            data += self.server_encode(buf)
+
+        size = min(struct.unpack('>H', os.urandom(2))[0] % 4096 + 100, len(buf))
+
+        data += b"\x16" + self.tls_version + struct.pack('>H', size) + buf[:size]
+
+        if len(buf) - size > 0:
+            buf = buf[size:]
+            while len(buf) > 2048:
+                size = min(struct.unpack('>H', os.urandom(2))[0] % 4096 + 100, len(buf))
+                data += b"\x17" + self.tls_version + struct.pack('>H', size) + buf[:size]
+                buf = buf[size:]
+            if len(buf) > 0:
+                data += b"\x17" + self.tls_version + struct.pack('>H', len(buf)) + buf
+
+        self.obfs_stage += 1
+
         return data
 
     def decode_error_return(self, buf):
-        self.handshake_status = -1
-        if self.overhead > 0:
-            self.server_info.overhead -= self.overhead
+        self.deobfs_stage = -1
+        self.obfs_stage = -1
         self.overhead = 0
-        if self.method == 'tls1.2_ticket_auth' or self.method == 'tls1.2_ticket_fastauth':
+        if self.method == 'simple_obfs_tls':
             return (b'E'*2048, False, False)
         return (buf, True, False)
 
     def server_decode(self, buf):
-        if self.handshake_status == -1:
+        if self.deobfs_stage == -1:
             return (buf, True, False)
 
-        if (self.handshake_status & 4) == 4:
+        if self.deobfs_stage == 1:
             ret = b''
             self.recv_buffer += buf
             while len(self.recv_buffer) > 5:
@@ -215,33 +215,12 @@ class tls_ticket_auth(plain.plain):
                 self.recv_buffer = self.recv_buffer[size+5:]
             return (ret, True, False)
 
-        if (self.handshake_status & 1) == 1:
-            self.recv_buffer += buf
-            buf = self.recv_buffer
-            verify = buf
-            if len(buf) < 11:
-                raise Exception('server_decode data error')
-            if not match_begin(buf, b"\x14" + self.tls_version + b"\x00\x01\x01"): #ChangeCipherSpec
-                raise Exception('server_decode data error')
-            buf = buf[6:]
-            if not match_begin(buf, b"\x16" + self.tls_version + b"\x00"): #Finished
-                raise Exception('server_decode data error')
-            verify_len = struct.unpack('>H', buf[3:5])[0] + 1 # 11 - 10
-            if len(verify) < verify_len + 10:
-                return (b'', False, False)
-            if hmac.new(self.server_info.key + self.client_id, verify[:verify_len], hashlib.sha1).digest()[:10] != verify[verify_len:verify_len+10]:
-                raise Exception('server_decode data error')
-            self.recv_buffer = verify[verify_len + 10:]
-            status = self.handshake_status
-            self.handshake_status |= 4
-            ret = self.server_decode(b'')
-            return ret;
-
         #raise Exception("handshake data = %s" % (binascii.hexlify(buf)))
+
         self.recv_buffer += buf
         buf = self.recv_buffer
         ogn_buf = buf
-        if len(buf) < 3:
+        if len(buf) < 5:
             return (b'', False, False)
         if not match_begin(buf, b'\x16\x03\x01'):
             return self.decode_error_return(ogn_buf)
@@ -251,7 +230,7 @@ class tls_ticket_auth(plain.plain):
             return (b'', False, False)
 
         self.recv_buffer = self.recv_buffer[header_len + 5:]
-        self.handshake_status = 1
+        self.deobfs_stage = 1
         buf = buf[2:header_len + 2]
         if not match_begin(buf, b'\x01\x00'): #client hello
             logging.info("tls_auth not client hello message")
@@ -274,7 +253,6 @@ class tls_ticket_auth(plain.plain):
         sessionid = buf[1:sessionid_len + 1]
         buf = buf[sessionid_len+1:]
         self.client_id = sessionid
-        sha1 = hmac.new(self.server_info.key + sessionid, verifyid[:22], hashlib.sha1).digest()[:10]
         utc_time = struct.unpack('>I', verifyid[:4])[0]
         time_dif = common.int32((int(time.time()) & 0xffffffff) - utc_time)
         if self.server_info.obfs_param:
@@ -286,27 +264,32 @@ class tls_ticket_auth(plain.plain):
                 or common.int32(utc_time - self.server_info.data.startup_time) < -self.max_time_dif / 2):
             logging.info("tls_auth wrong time")
             return self.decode_error_return(ogn_buf)
-        if sha1 != verifyid[22:]:
-            logging.info("tls_auth wrong sha1")
-            return self.decode_error_return(ogn_buf)
         if self.server_info.data.client_data.get(verifyid[:22]):
             logging.info("replay attack detect, id = %s" % (binascii.hexlify(verifyid)))
             return self.decode_error_return(ogn_buf)
         self.server_info.data.client_data.sweep()
         self.server_info.data.client_data[verifyid[:22]] = sessionid
-        if len(self.recv_buffer) >= 11:
-            ret = self.server_decode(b'')
-            return (ret[0], True, True)
         # (buffer_to_recv, is_need_decrypt, is_need_to_encode_and_send_back)
 
-        buf = buf[48:]
+        buf = buf[62:]
+        if not match_begin(buf, b'\x00\x23'):
+            logging.info("ext header error")
+            return self.decode_error_return(ogn_buf)
+
+        buf = buf[2:]
+        ext_length = struct.unpack('>H', buf[:2])[0]
+        buf = buf[2:]
+        ret = buf[:ext_length]
+        if len(self.recv_buffer) > 0:
+            ret += self.server_decode(b'')[0]
+        buf = buf[ext_length:]
 
         host_name = b''
-        for index in range(len(buf)):
-            if index + 4 < len(buf):
-                if buf[index:index + 4] == b"\x00\x17\x00\x00":
-                    if buf[:index] != '':
-                        host_name = buf[:index]
-        host_name = host_name.decode('utf-8')
+        buf = buf[7:]
+        host_name_len = struct.unpack('>H', buf[:2])[0]
+        buf = buf[2:]
+        hostname = buf[:host_name_len]
 
-        return (b'', False, True, host_name)
+        host_name = common.to_str(hostname)
+
+        return (ret, True, False, host_name)
